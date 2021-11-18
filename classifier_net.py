@@ -14,23 +14,23 @@ class ClassifierNet(nn.Module):
             nn.Dropout(.2),
             nn.LeakyReLU(.2),
 
-            #nn.Linear(256, 256),
-            #nn.Dropout(.2),
-            #nn.LeakyReLU(.2),
+            nn.Linear(256, 256),
+            nn.Dropout(.2),
+            nn.LeakyReLU(.2),
 
-            #nn.Linear(256, 256),
-            #nn.Dropout(.2),
-            #nn.LeakyReLU(.2),
+            # nn.Linear(256, 256),
+            # nn.Dropout(.2),
+            # nn.LeakyReLU(.2),
 
             nn.Linear(256, 64),
-            #nn.Dropout(.2),
+            # nn.Dropout(.2),
             nn.LeakyReLU(.2),
 
-            nn.Linear(64, 8),
-            #nn.Dropout(.2),
+            nn.Linear(64, 16),
+            # nn.Dropout(.2),
             nn.LeakyReLU(.2),
 
-            nn.Linear(8, 1),
+            nn.Linear(16, 1),
             nn.Sigmoid()
         ).type(torch.float)
 

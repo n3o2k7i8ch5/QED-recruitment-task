@@ -1,5 +1,6 @@
 import gc
 import os
+from math import log
 from statistics import mean
 
 import pandas as pd
@@ -16,8 +17,8 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, TensorDataset
 
 from classifier_net import ClassifierNet
-from data_prep import prep_data
-from ip_to_tensor import ip_to_bin_list
+from prep_data import prep_data
+from prep_lstm_data import prep_lstm_data
 
 LOCALIZED_ALERTS_PATH = 'data/localized_alerts_data.csv'
 DUMPS_PATH = 'dumps'
@@ -51,36 +52,14 @@ else:
     print(f'Generating logstack from file {LOCALIZED_ALERTS_PATH}')
     localized_alerts = pd.read_csv(LOCALIZED_ALERTS_PATH, sep='|')
 
-    logstacks = prep_data(localized_alerts,id_dict=tmp_data_ids)
+    logstacks = prep_lstm_data(localized_alerts,id_dict=tmp_data_ids)
 
     del localized_alerts
 
     with open(LOGSTACK_PATH, 'wb') as handle:
         pickle.dump(logstacks, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
-dstip_lists = [ip_to_bin_list(ip) for ip in data_x['ip']]
-dstip_df = pd.DataFrame(dstip_lists, columns=[f'p_{i}' for i in range(40)])
-dstip_df.index = data_x.index
-data_x = pd.concat([data_x, dstip_df], axis=1)
-data_x.pop('ip')
-
-data_x = pd.get_dummies(data_x, columns=[
-    'categoryname', 'ipcategory_name', 'ipcategory_scope',
-    'parent_category', 'grandparent_category', 'overallseverity', 'weekday',
-    'n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n9', 'n10',
-    'score',
-
-    'alerttype_cd', 'direction_cd', 'eventname_cd', 'severity_cd',
-    'reportingdevice_cd', 'devicetype_cd', 'devicevendor_cd', 'domain_cd',
-    'protocol_cd', 'username_cd', 'srcipcategory_cd', 'dstipcategory_cd',
-    'isiptrusted', 'untrustscore', 'flowscore', 'trustscore', 'enforcementscore',
-
-    'dstipcategory_dominate', 'srcipcategory_dominate',
-    'dstportcategory_dominate', 'srcportcategory_dominate',
-    'p6', 'p9', 'p5m', 'p5w', 'p5d', 'p8m', 'p8w', 'p8d'
-], prefix_sep='$', dummy_na=True)
-
-data_x.drop(columns=['start_hour', 'start_minute', 'start_second'])
+data_x = prep_data(data_x)
 
 print(f'data_x shape = {data_x.shape}')
 
@@ -96,6 +75,7 @@ data_y_train = torch.tensor(data_y[:_limit].to_numpy())
 data_y_test = torch.tensor(data_y[_limit:].to_numpy())
 
 # dec tree
+'''
 dec_tree = DecisionTreeClassifier(class_weight={0: class_ratio, 1: 1 - class_ratio})
 dec_tree.fit(data_x_train, data_y_train)
 
@@ -111,8 +91,10 @@ print('Dec tree auc:', auc)
 del dec_tree
 del data_pred
 del succ
+'''
 
 # random forest
+'''
 rand_forest = RandomForestClassifier(class_weight={0: class_ratio, 1: 1 - class_ratio}, n_estimators=60)
 rand_forest.fit(data_x_train, data_y_train)
 
@@ -128,12 +110,12 @@ print('Random forest auc:', auc)
 del rand_forest
 del data_pred
 del succ
-
+'''
 # neural network
 
 BATCH_SIZE = 2
-LSTM_OUTPUT_SIZE = 20
-NUM_LAYERS = 4
+LSTM_OUTPUT_SIZE = 80
+NUM_LAYERS = 8
 
 train_data_loader = DataLoader(TensorDataset(data_ids_train, data_x_train, data_y_train), batch_size=BATCH_SIZE,
                                shuffle=True)
@@ -145,6 +127,7 @@ print('device in use:', torch.cuda.get_device_name(torch.cuda.current_device()))
 device = torch.device("cuda")
 
 neural_net = ClassifierNet(input_size=len(data_x.columns) + LSTM_OUTPUT_SIZE).to(device)
+#neural_net = ClassifierNet(input_size=len(data_x.columns)).to(device)
 
 LSTM_INPUT_SIZE = len(list(logstacks.values())[0].columns)
 print(f'LSTM input size: {LSTM_INPUT_SIZE}')
@@ -153,7 +136,7 @@ lstm = LSTM(
     input_size=LSTM_INPUT_SIZE,
     hidden_size=LSTM_OUTPUT_SIZE,
     num_layers=NUM_LAYERS,
-    # dropout=0.2,
+    dropout=0.2,
     batch_first=True).float().to(device)
 
 del data
@@ -172,8 +155,8 @@ del data_y_test
 
 del tmp_data_ids
 
-optim_net = AdamW(neural_net.parameters(), lr=.0001)
-optim_lstm = AdamW(lstm.parameters(), lr=.0001)
+optim_net = AdamW(neural_net.parameters(), lr=.00001)
+optim_lstm = AdamW(lstm.parameters(), lr=.00001)
 
 valid_iterator = enumerate(valid_data_loader)
 
@@ -183,12 +166,15 @@ def loss_fun(real: torch.Tensor, pred: torch.Tensor) -> Variable:
     # return loss(pred, real)
 
     real_np = real.detach().cpu().numpy()
-    weight = torch.tensor([1] * (1 if type(real_np) == float else len(real_np)), device=device)
-    selector = real_np == 1
-    weight[selector] = 20
-    return (weight * (real - pred) ** 2).mean()
+    tensor_len = 1 if type(real_np) == float else len(real_np)
+    weight = torch.tensor([1] * tensor_len, device=device)
+    weight[real_np == 1] = 1/ class_ratio
 
-if False:
+    weighted_squares = weight * ((real - pred)) ** 2
+    return weighted_squares.mean()
+
+
+if True:
     if os.path.exists(NEURAL_NET_SAVE_PATH):
         neural_net.load_state_dict(torch.load(NEURAL_NET_SAVE_PATH))
         print(f'Loaded neural_net from {NEURAL_NET_SAVE_PATH}')
@@ -197,13 +183,34 @@ if False:
         lstm.load_state_dict(torch.load(LSTM_SAVE_PATH))
         print(f'Loaded lstm from {LSTM_SAVE_PATH}')
 
+
+def eval_batch(y_data, pred_data):
+    pred_data_cpu: np.ndarray = pred_data.detach().cpu().numpy()
+    batch_y_cpu: np.ndarray = y_data.detach().cpu().numpy()
+
+    acc = (pred_data_cpu > .5) == (batch_y_cpu > .5)
+    acc = len(acc[acc == True]) / len(acc)
+
+    if BATCH_SIZE == 1:
+        auc_true = [batch_y_cpu]
+        auc_pred = [pred_data_cpu]
+    else:
+        auc_true = batch_y_cpu.tolist()
+        auc_pred = pred_data_cpu.tolist()
+
+    return acc, auc_true, auc_pred
+
 for epoch in range(15):
 
     losses = []
-    valid_losses = []
     accs = []
     aucs_true = []
     aucs_pred = []
+
+    valid_losses = []
+    accs_valid = []
+    aucs_true_valid = []
+    aucs_pred_valid = []
 
     for n_batch, (_batch_ids, _batch_x, _batch_y) in enumerate(train_data_loader):
 
@@ -212,18 +219,18 @@ for epoch in range(15):
 
         vals = [torch.tensor(logstacks[_id.item()].to_numpy() if _id.item() in logstacks else np.array([[0] * LSTM_INPUT_SIZE])) for _id in _batch_ids]
         vals_padd: torch.Tensor = torch.nn.utils.rnn.pad_sequence(vals, batch_first=True).float().to(device)
-        #print(vals_padd.size())
 
         lstm_all_outs, _ = lstm.forward(vals_padd)
         del vals
         del vals_padd
-
+        
         lstm_out = lstm_all_outs[:, -1, :]
         del lstm_all_outs
 
         _batch_x = _batch_x.type(torch.FloatTensor).to(device)
         _batch_y = _batch_y.type(torch.FloatTensor).to(device).squeeze()
 
+        #pred_data = neural_net.forward(_batch_x).squeeze()
         pred_data = neural_net.forward(torch.cat([_batch_x, lstm_out], dim=1)).squeeze()
         del _batch_x
         del lstm_out
@@ -233,6 +240,11 @@ for epoch in range(15):
         loss.backward()
         optim_net.step()
         optim_lstm.step()
+
+        acc, auc_true, auc_pred = eval_batch(_batch_y, pred_data)
+        accs.append(acc)
+        aucs_true.extend(auc_true)
+        aucs_pred.extend(auc_pred)
 
         del _batch_y
         del pred_data
@@ -257,6 +269,7 @@ for epoch in range(15):
         lstm_out_valid = lstm_all_outs_valid[:, -1, :]
         del lstm_all_outs_valid
 
+        #pred_valid_data = neural_net.forward(_batch_x_valid).squeeze()
         pred_valid_data = neural_net.forward(torch.cat([_batch_x_valid, lstm_out_valid], dim=1)).squeeze()
         del _batch_x_valid
         del lstm_out_valid
@@ -264,50 +277,46 @@ for epoch in range(15):
         valid_loss = loss_fun(_batch_y_valid, pred_valid_data)
         valid_losses.append(valid_loss.item())
 
-        pred_valid_data_cpu: np.ndarray = pred_valid_data.detach().cpu().numpy()
-        _batch_y_valid_cpu: np.ndarray = _batch_y_valid.detach().cpu().numpy()
-
-        acc = (pred_valid_data_cpu > .5) == (_batch_y_valid_cpu > .5)
-        accs.append(len(acc[acc == True]) / len(acc))
-
-        if BATCH_SIZE == 1:
-            aucs_true.append(_batch_y_valid_cpu)
-            aucs_pred.append(pred_valid_data_cpu)
-        else:
-            aucs_true.extend(_batch_y_valid_cpu.tolist())
-            aucs_pred.extend(pred_valid_data_cpu.tolist())
+        acc_v, auc_true_v, auc_pred_v = eval_batch(_batch_y_valid, pred_valid_data)
+        accs_valid.append(acc_v)
+        aucs_true_valid.extend(auc_true_v)
+        aucs_pred_valid.extend(auc_pred_v)
 
         del _
         del _batch_ids_valid
         del _batch_y_valid
 
         del pred_valid_data
-        del pred_valid_data_cpu
-        del _batch_y_valid_cpu
 
         del valid_loss
 
         gc.collect()
         torch.cuda.empty_cache()
 
-        if n_batch % 500 == 499:
+        if n_batch % 10 == 0:
+          print('.', end=' ')
+
+        if n_batch % 100 == 99:
             auc = metrics.roc_auc_score(aucs_true, aucs_pred)
-            auc_bin = metrics.roc_auc_score(aucs_true, [(0 if x < .5 else 1) for x in aucs_pred])
             aucs_true = []
             aucs_pred = []
+
+            auc_v = metrics.roc_auc_score(aucs_true_valid, aucs_pred_valid)
+            aucs_true_valid = []
+            aucs_pred_valid = []
 
             print(
                 'epoch:', epoch,
                 'n_batch:', n_batch,
-                'loss:', "{:.6f}".format(round(mean(losses), 6)),
-                'valid_loss:', "{:.6f}".format(round(mean(valid_losses), 6)),
-                'acc:', mean(accs),
-                'auc:', auc,
-                'auc_bin:', auc_bin
+                ':: loss (valid):', "{:.3f}".format(round(mean(losses), 3)), "{:.3f}".format(round(mean(valid_losses), 3)),
+
+                ':: acc (valid):', "{:.3f}".format(round(mean(accs), 3)), "{:.3f}".format(round(mean(accs_valid), 3)),
+
+                ':: auc (valid):', "{:.3f}".format(round(auc, 3)), "{:.3f}".format(round(auc_v, 3)),
             )
             losses = []
             valid_loss = []
-            accs = []
+            accs_valid = []
 
             torch.save(neural_net.state_dict(), NEURAL_NET_SAVE_PATH)
             torch.save(lstm.state_dict(), LSTM_SAVE_PATH)

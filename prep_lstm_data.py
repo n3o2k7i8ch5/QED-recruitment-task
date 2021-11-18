@@ -1,3 +1,5 @@
+from math import log, copysign
+
 import pandas as pd
 
 from ip_to_tensor import ip_to_bin_list, port_to_bin_list
@@ -38,17 +40,19 @@ def __protocol_simpl(x):
         return 'other'
 
 
-def prep_data(data: pd.DataFrame, id_dict):
+def prep_lstm_data(data: pd.DataFrame, id_dict):
     ids = data['alert_ids'].tolist()
 
     data['protocol'] = data['protocol'].apply(__protocol_simpl)
+    data['alerttime'] = data['alerttime'].apply(lambda x: copysign(1, x) * log(abs(x)+1, 1.1))
+    data['count'] = data['count'].apply(lambda x: log(x+1, 1.1))
 
     dummy_cols = [
         'alerttype', 'devicetype',
         'devicevendor_code',
         # 'srcip', 'dstip',
         'srcipcategory', 'dstipcategory',
-
+        'srcportcategory', 'dstportcategory',
     ]
 
     drop_cols = ['reportingdevice_code',  # 1889
