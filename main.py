@@ -52,7 +52,7 @@ else:
     print(f'Generating logstack from file {LOCALIZED_ALERTS_PATH}')
     localized_alerts = pd.read_csv(LOCALIZED_ALERTS_PATH, sep='|')
 
-    logstacks = prep_lstm_data(localized_alerts,id_dict=tmp_data_ids)
+    logstacks = prep_lstm_data(localized_alerts, id_dict=tmp_data_ids)
 
     del localized_alerts
 
@@ -63,7 +63,7 @@ data_x = prep_data(data_x)
 
 print(f'data_x shape = {data_x.shape}')
 
-_limit = int(.8 * len(data_x))
+_limit = int(.9 * len(data_x))
 
 data_ids_train = torch.tensor(data_ids_num[:_limit])
 data_ids_test = torch.tensor(data_ids_num[_limit:])
@@ -113,9 +113,10 @@ del succ
 '''
 # neural network
 
-BATCH_SIZE = 2
-LSTM_OUTPUT_SIZE = 80
-NUM_LAYERS = 8
+BATCH_SIZE = 24
+LSTM_OUTPUT_SIZE = 160
+NUM_LAYERS = 5
+LSTM_SEQ_TRUNC = 3200
 
 train_data_loader = DataLoader(TensorDataset(data_ids_train, data_x_train, data_y_train), batch_size=BATCH_SIZE,
                                shuffle=True)
@@ -127,7 +128,7 @@ print('device in use:', torch.cuda.get_device_name(torch.cuda.current_device()))
 device = torch.device("cuda")
 
 neural_net = ClassifierNet(input_size=len(data_x.columns) + LSTM_OUTPUT_SIZE).to(device)
-#neural_net = ClassifierNet(input_size=len(data_x.columns)).to(device)
+# neural_net = ClassifierNet(input_size=len(data_x.columns)).to(device)
 
 LSTM_INPUT_SIZE = len(list(logstacks.values())[0].columns)
 print(f'LSTM input size: {LSTM_INPUT_SIZE}')
@@ -136,7 +137,7 @@ lstm = LSTM(
     input_size=LSTM_INPUT_SIZE,
     hidden_size=LSTM_OUTPUT_SIZE,
     num_layers=NUM_LAYERS,
-    dropout=0.2,
+    dropout=0.3,
     batch_first=True).float().to(device)
 
 del data
@@ -155,8 +156,8 @@ del data_y_test
 
 del tmp_data_ids
 
-optim_net = AdamW(neural_net.parameters(), lr=.00001)
-optim_lstm = AdamW(lstm.parameters(), lr=.00001)
+optim_net = AdamW(neural_net.parameters(), lr=.00008)
+optim_lstm = AdamW(lstm.parameters(), lr=.00008)
 
 valid_iterator = enumerate(valid_data_loader)
 
@@ -166,11 +167,16 @@ def loss_fun(real: torch.Tensor, pred: torch.Tensor) -> Variable:
     # return loss(pred, real)
 
     real_np = real.detach().cpu().numpy()
-    tensor_len = 1 if type(real_np) == float else len(real_np)
-    weight = torch.tensor([1] * tensor_len, device=device)
-    weight[real_np == 1] = 1/ class_ratio
+    tensor_len = 1 if type(real_np.tolist()) == float else len(real_np.tolist())
+    weight = torch.tensor([1.] * tensor_len, device=device)
 
-    weighted_squares = weight * ((real - pred)) ** 2
+    if BATCH_SIZE == 1:
+        weight *= (1 / class_ratio) if real_np.tolist() == 1 else 1.
+    else:
+        selector = real_np == 1
+        weight[selector] = 1 / class_ratio
+
+    weighted_squares = weight * (real - pred) ** 2
     return weighted_squares.mean()
 
 
@@ -188,19 +194,28 @@ def eval_batch(y_data, pred_data):
     pred_data_cpu: np.ndarray = pred_data.detach().cpu().numpy()
     batch_y_cpu: np.ndarray = y_data.detach().cpu().numpy()
 
-    acc = (pred_data_cpu > .5) == (batch_y_cpu > .5)
-    acc = len(acc[acc == True]) / len(acc)
+    acc_arr = (pred_data_cpu > .5) == (batch_y_cpu > .5)
+    if BATCH_SIZE == 1:
+        acc = 1 if acc_arr.tolist()[0] else 0
+    else:
+        acc = len(acc_arr[acc_arr == True]) / len(acc_arr)
 
     if BATCH_SIZE == 1:
         auc_true = [batch_y_cpu]
         auc_pred = [pred_data_cpu]
     else:
         auc_true = batch_y_cpu.tolist()
+        if type(auc_true) == float:
+            auc_true = [auc_true]
+
         auc_pred = pred_data_cpu.tolist()
+        if type(auc_pred) == float:
+            auc_pred = [auc_pred]
 
     return acc, auc_true, auc_pred
 
-for epoch in range(15):
+
+for epoch in range(30):
 
     losses = []
     accs = []
@@ -217,20 +232,33 @@ for epoch in range(15):
         optim_net.zero_grad()
         optim_lstm.zero_grad()
 
-        vals = [torch.tensor(logstacks[_id.item()].to_numpy() if _id.item() in logstacks else np.array([[0] * LSTM_INPUT_SIZE])) for _id in _batch_ids]
+        vals = []
+        for _id in _batch_ids:
+            if _id.item() not in logstacks:
+                vals.append(torch.tensor(np.array([[0] * LSTM_INPUT_SIZE])))
+                continue
+
+            tens = logstacks[_id.item()].to_numpy()
+            if len(tens) > LSTM_SEQ_TRUNC:
+                tens = tens[-LSTM_SEQ_TRUNC:, :]
+
+            vals.append(torch.tensor(tens))
+
         vals_padd: torch.Tensor = torch.nn.utils.rnn.pad_sequence(vals, batch_first=True).float().to(device)
 
+        lstm.train(True)
         lstm_all_outs, _ = lstm.forward(vals_padd)
         del vals
         del vals_padd
-        
+
         lstm_out = lstm_all_outs[:, -1, :]
         del lstm_all_outs
 
-        _batch_x = _batch_x.type(torch.FloatTensor).to(device)
-        _batch_y = _batch_y.type(torch.FloatTensor).to(device).squeeze()
+        _batch_x: torch.Tensor = _batch_x.type(torch.FloatTensor).to(device)
+        _batch_y: torch.Tensor = _batch_y.type(torch.FloatTensor).to(device)
 
-        #pred_data = neural_net.forward(_batch_x).squeeze()
+        # pred_data = neural_net.forward(_batch_x).squeeze()
+        neural_net.train(True)
         pred_data = neural_net.forward(torch.cat([_batch_x, lstm_out], dim=1)).squeeze()
         del _batch_x
         del lstm_out
@@ -240,6 +268,9 @@ for epoch in range(15):
         loss.backward()
         optim_net.step()
         optim_lstm.step()
+
+        pred_data[pred_data > 1] = 1
+        pred_data[pred_data < 0] = 0
 
         acc, auc_true, auc_pred = eval_batch(_batch_y, pred_data)
         accs.append(acc)
@@ -259,23 +290,39 @@ for epoch in range(15):
         _batch_x_valid = _batch_x_valid.type(torch.FloatTensor).to(device)
         _batch_y_valid = _batch_y_valid.type(torch.FloatTensor).to(device)
 
-        vals = [torch.tensor(logstacks[_id.item()].to_numpy()) for _id in _batch_ids_valid]
-        vals_padd: torch.Tensor = torch.nn.utils.rnn.pad_sequence(vals, batch_first=True).float().to(device)
-        lstm_all_outs_valid, _ = lstm.forward(vals_padd)
+        vals_valid = []
+        for _id in _batch_ids_valid:
+            if _id.item() not in logstacks:
+                vals_valid.append(torch.tensor(np.array([[0] * LSTM_INPUT_SIZE])))
+                continue
 
-        del vals
-        del vals_padd
+            tens = logstacks[_id.item()].to_numpy()
+            if len(tens) > LSTM_SEQ_TRUNC:
+                tens = tens[-LSTM_SEQ_TRUNC:, :]
+
+            vals_valid.append(torch.tensor(tens))
+
+        vals_valid_padd: torch.Tensor = torch.nn.utils.rnn.pad_sequence(vals_valid, batch_first=True).float().to(device)
+        lstm.train(False)
+        lstm_all_outs_valid, _ = lstm.forward(vals_valid_padd)
+
+        del vals_valid
+        del vals_valid_padd
 
         lstm_out_valid = lstm_all_outs_valid[:, -1, :]
         del lstm_all_outs_valid
 
-        #pred_valid_data = neural_net.forward(_batch_x_valid).squeeze()
+        # pred_valid_data = neural_net.forward(_batch_x_valid).squeeze()
+        neural_net.train(False)
         pred_valid_data = neural_net.forward(torch.cat([_batch_x_valid, lstm_out_valid], dim=1)).squeeze()
         del _batch_x_valid
         del lstm_out_valid
 
         valid_loss = loss_fun(_batch_y_valid, pred_valid_data)
         valid_losses.append(valid_loss.item())
+
+        pred_valid_data[pred_valid_data > 1] = 1
+        pred_valid_data[pred_valid_data < 0] = 0
 
         acc_v, auc_true_v, auc_pred_v = eval_batch(_batch_y_valid, pred_valid_data)
         accs_valid.append(acc_v)
@@ -294,7 +341,7 @@ for epoch in range(15):
         torch.cuda.empty_cache()
 
         if n_batch % 10 == 0:
-          print('.', end=' ')
+            print('.', end=' ')
 
         if n_batch % 100 == 99:
             auc = metrics.roc_auc_score(aucs_true, aucs_pred)
@@ -308,7 +355,8 @@ for epoch in range(15):
             print(
                 'epoch:', epoch,
                 'n_batch:', n_batch,
-                ':: loss (valid):', "{:.3f}".format(round(mean(losses), 3)), "{:.3f}".format(round(mean(valid_losses), 3)),
+                ':: loss (valid):', "{:.3f}".format(round(mean(losses), 3)),
+                "{:.3f}".format(round(mean(valid_losses), 3)),
 
                 ':: acc (valid):', "{:.3f}".format(round(mean(accs), 3)), "{:.3f}".format(round(mean(accs_valid), 3)),
 
